@@ -1,1 +1,12 @@
 /target
+
+# >>> course-tool records
+!/.ai/
+!/.ai/.gitignore
+!/.ai/agent-sessions/
+!/.ai/agent-sessions/**
+!/.ai/events/
+!/.ai/events/**
+!/.ai/submissions/
+!/.ai/submissions/**
+# <<< course-tool records
