@@ -8,8 +8,12 @@ use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
+pub mod bench;
+pub mod linear;
+
 pub const MAX_RULES: usize = 1024;
 const BV_WORDS: usize = MAX_RULES / 64; 
+const HASH_BUCKETS: usize = 256;       
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BitVector1024 {
@@ -99,14 +103,16 @@ pub struct LbvsEngine {
     proto_icmp: BitVector1024,
 
     dst_port_wildcard: BitVector1024,
-    dst_port_entries: Vec<(u16, BitVector1024)>,
+    dst_port_buckets: [Vec<(u16, BitVector1024)>; HASH_BUCKETS],
 
     dst_ip_wildcard: BitVector1024,
-    dst_ip_entries: Vec<(Ipv4Address, BitVector1024)>,
+    dst_ip_buckets: [Vec<(Ipv4Address, BitVector1024)>; HASH_BUCKETS],
 }
 
 impl LbvsEngine {
     pub fn new(default_policy: FilterVerdict) -> Self {
+        const EMPTY_VEC_PORT: Vec<(u16, BitVector1024)> = Vec::new();
+        const EMPTY_VEC_IP: Vec<(Ipv4Address, BitVector1024)> = Vec::new();
         Self {
             rules: Vec::new(),
             default_policy,
@@ -115,9 +121,9 @@ impl LbvsEngine {
             proto_udp: BitVector1024::zero(),
             proto_icmp: BitVector1024::zero(),
             dst_port_wildcard: BitVector1024::zero(),
-            dst_port_entries: Vec::new(),
+            dst_port_buckets: [EMPTY_VEC_PORT; HASH_BUCKETS],
             dst_ip_wildcard: BitVector1024::zero(),
-            dst_ip_entries: Vec::new(),
+            dst_ip_buckets: [EMPTY_VEC_IP; HASH_BUCKETS],
         }
     }
 
@@ -128,10 +134,14 @@ impl LbvsEngine {
         self.proto_icmp = BitVector1024::zero();
 
         self.dst_port_wildcard = BitVector1024::zero();
-        self.dst_port_entries.clear();
+        for b in self.dst_port_buckets.iter_mut() {
+            b.clear();
+        }
 
         self.dst_ip_wildcard = BitVector1024::zero();
-        self.dst_ip_entries.clear();
+        for b in self.dst_ip_buckets.iter_mut() {
+            b.clear();
+        }
 
         for (idx, rule) in self.rules.iter().enumerate().take(MAX_RULES) {
             match rule.proto {
@@ -145,12 +155,13 @@ impl LbvsEngine {
             match rule.dst_port {
                 None => self.dst_port_wildcard.set_bit(idx),
                 Some(port) => {
-                    if let Some(entry) = self.dst_port_entries.iter_mut().find(|(p, _)| *p == port) {
+                    let bucket = ((port as usize) ^ (port as usize >> 8)) % HASH_BUCKETS;
+                    if let Some(entry) = self.dst_port_buckets[bucket].iter_mut().find(|(p, _)| *p == port) {
                         entry.1.set_bit(idx);
                     } else {
                         let mut bv = BitVector1024::zero();
                         bv.set_bit(idx);
-                        self.dst_port_entries.push((port, bv));
+                        self.dst_port_buckets[bucket].push((port, bv));
                     }
                 }
             }
@@ -158,24 +169,28 @@ impl LbvsEngine {
             match rule.dst_ip {
                 None => self.dst_ip_wildcard.set_bit(idx),
                 Some(ip) => {
-                    if let Some(entry) = self.dst_ip_entries.iter_mut().find(|(i, _)| *i == ip) {
+                    let ip_bytes = ip.octets();
+                    let bucket = ((ip_bytes[2] as usize) << 8 | (ip_bytes[3] as usize)) % HASH_BUCKETS;
+                    if let Some(entry) = self.dst_ip_buckets[bucket].iter_mut().find(|(i, _)| *i == ip) {
                         entry.1.set_bit(idx);
                     } else {
                         let mut bv = BitVector1024::zero();
                         bv.set_bit(idx);
-                        self.dst_ip_entries.push((ip, bv));
+                        self.dst_ip_buckets[bucket].push((ip, bv));
                     }
                 }
             }
         }
     }
 
+    #[inline(never)]
     pub fn classify(&self, pkt: &PacketInfo) -> FilterVerdict {
         let mut tmp_bv = BitVector1024::ones();
 
         let mut port_bv = self.dst_port_wildcard;
         if let Some(dport) = pkt.dst_port {
-            if let Some((_, bv)) = self.dst_port_entries.iter().find(|(p, _)| *p == dport) {
+            let bucket = ((dport as usize) ^ (dport as usize >> 8)) % HASH_BUCKETS;
+            if let Some((_, bv)) = self.dst_port_buckets[bucket].iter().find(|(p, _)| *p == dport) {
                 for i in 0..BV_WORDS {
                     port_bv.bits[i] |= bv.bits[i];
                 }
@@ -202,7 +217,9 @@ impl LbvsEngine {
         }
 
         let mut ip_bv = self.dst_ip_wildcard;
-        if let Some((_, bv)) = self.dst_ip_entries.iter().find(|(ip, _)| *ip == pkt.dst_ip) {
+        let ip_bytes = pkt.dst_ip.octets();
+        let bucket = ((ip_bytes[2] as usize) << 8 | (ip_bytes[3] as usize)) % HASH_BUCKETS;
+        if let Some((_, bv)) = self.dst_ip_buckets[bucket].iter().find(|(ip, _)| *ip == pkt.dst_ip) {
             for i in 0..BV_WORDS {
                 ip_bv.bits[i] |= bv.bits[i];
             }
@@ -245,7 +262,9 @@ pub fn init_firewall() {
 
     engine.build();
     *FIREWALL_ENGINE.lock() = Some(engine);
-    log::info!("[axfirewall] Global RuleManager initialized with LBVS (1024 rules support)!");
+    log::info!("[axfirewall] Global RuleManager initialized with Hash-LBVS!");
+
+    bench::run_evaluation();
 }
 
 pub fn add_rule(rule: Rule) {
@@ -254,9 +273,6 @@ pub fn add_rule(rule: Rule) {
         if engine.rules.len() < MAX_RULES {
             engine.rules.push(rule);
             engine.build();
-            log::info!("[axfirewall] Rule added dynamically. Current count: {}", engine.rules.len());
-        } else {
-            log::warn!("[axfirewall] Max rules capacity ({}) reached!", MAX_RULES);
         }
     }
 }
@@ -266,7 +282,6 @@ pub fn flush_rules() {
     if let Some(engine) = lock.as_mut() {
         engine.rules.clear();
         engine.build();
-        log::info!("[axfirewall] All rules flushed!");
     }
 }
 
@@ -317,7 +332,6 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     };
 
     let mut lock = FIREWALL_ENGINE.lock();
-    
     if lock.is_none() {
         drop(lock);
         init_firewall();
