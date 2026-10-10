@@ -2,6 +2,7 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
@@ -88,12 +89,10 @@ pub struct Rule {
     pub verdict: FilterVerdict,
 }
 
-/// LBVS 多维规则索引表
 pub struct LbvsEngine {
     pub rules: Vec<Rule>,
     pub default_policy: FilterVerdict,
 
-    // 各维度的映射表与通配符位向量
     proto_wildcard: BitVector1024,
     proto_tcp: BitVector1024,
     proto_udp: BitVector1024,
@@ -122,7 +121,6 @@ impl LbvsEngine {
         }
     }
 
-    /// 编译/重建 LBVS 矩阵
     pub fn build(&mut self) {
         self.proto_wildcard = BitVector1024::zero();
         self.proto_tcp = BitVector1024::zero();
@@ -172,7 +170,6 @@ impl LbvsEngine {
         }
     }
 
-    /// LBVS 报文分类主流程
     pub fn classify(&self, pkt: &PacketInfo) -> FilterVerdict {
         let mut tmp_bv = BitVector1024::ones();
 
@@ -223,7 +220,56 @@ impl LbvsEngine {
     }
 }
 
-/// 零拷贝报文解析
+pub static FIREWALL_ENGINE: Mutex<Option<LbvsEngine>> = Mutex::new(None);
+
+pub fn init_firewall() {
+    let mut engine = LbvsEngine::new(FilterVerdict::Accept);
+
+    for p in 8000..8050 {
+        engine.rules.push(Rule {
+            proto: Some(L4Protocol::Tcp),
+            src_ip: None,
+            dst_ip: None,
+            dst_port: Some(p),
+            verdict: FilterVerdict::Accept,
+        });
+    }
+
+    engine.rules.push(Rule {
+        proto: Some(L4Protocol::Tcp),
+        src_ip: None,
+        dst_ip: None,
+        dst_port: Some(5555),
+        verdict: FilterVerdict::Drop,
+    });
+
+    engine.build();
+    *FIREWALL_ENGINE.lock() = Some(engine);
+    log::info!("[axfirewall] Global RuleManager initialized with LBVS (1024 rules support)!");
+}
+
+pub fn add_rule(rule: Rule) {
+    let mut lock = FIREWALL_ENGINE.lock();
+    if let Some(engine) = lock.as_mut() {
+        if engine.rules.len() < MAX_RULES {
+            engine.rules.push(rule);
+            engine.build();
+            log::info!("[axfirewall] Rule added dynamically. Current count: {}", engine.rules.len());
+        } else {
+            log::warn!("[axfirewall] Max rules capacity ({}) reached!", MAX_RULES);
+        }
+    }
+}
+
+pub fn flush_rules() {
+    let mut lock = FIREWALL_ENGINE.lock();
+    if let Some(engine) = lock.as_mut() {
+        engine.rules.clear();
+        engine.build();
+        log::info!("[axfirewall] All rules flushed!");
+    }
+}
+
 pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     let eth_frame = EthernetFrame::new_checked(raw_pkt).ok()?;
     if eth_frame.ethertype() != EthernetProtocol::Ipv4 {
@@ -264,49 +310,36 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     })
 }
 
-fn get_test_engine() -> LbvsEngine {
-    let mut engine = LbvsEngine::new(FilterVerdict::Accept);
-
-    for p in 8000..8050 {
-        engine.rules.push(Rule {
-            proto: Some(L4Protocol::Tcp),
-            src_ip: None,
-            dst_ip: None,
-            dst_port: Some(p),
-            verdict: FilterVerdict::Accept,
-        });
-    }
-
-    engine.rules.push(Rule {
-        proto: Some(L4Protocol::Tcp),
-        src_ip: None,
-        dst_ip: None,
-        dst_port: Some(5555),
-        verdict: FilterVerdict::Drop,
-    });
-
-    engine.build();
-    engine
-}
-
 pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     let pkt_info = match parse_packet(raw_pkt) {
         Some(info) => info,
         None => return FilterVerdict::Accept,
     };
 
-    let engine = get_test_engine();
-    let verdict = engine.classify(&pkt_info);
+    let mut lock = FIREWALL_ENGINE.lock();
+    
+    if lock.is_none() {
+        drop(lock);
+        init_firewall();
+        lock = FIREWALL_ENGINE.lock();
+    }
 
-    log::info!(
-        "[axfirewall-lbvs] {:?} {}:{} -> {}:{} => {:?}",
-        pkt_info.proto,
-        pkt_info.src_ip,
-        pkt_info.src_port.unwrap_or(0),
-        pkt_info.dst_ip,
-        pkt_info.dst_port.unwrap_or(0),
-        verdict
-    );
+    let verdict = if let Some(ref engine) = *lock {
+        engine.classify(&pkt_info)
+    } else {
+        FilterVerdict::Accept
+    };
+
+    if verdict == FilterVerdict::Drop {
+        log::warn!(
+            "[axfirewall-lbvs] DROP: {:?} {}:{} -> {}:{}",
+            pkt_info.proto,
+            pkt_info.src_ip,
+            pkt_info.src_port.unwrap_or(0),
+            pkt_info.dst_ip,
+            pkt_info.dst_port.unwrap_or(0),
+        );
+    }
 
     verdict
 }
