@@ -1,11 +1,67 @@
 #![no_std]
-use smoltcp::wire::{EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket};
-#[derive(Debug,Clone,Copy,PartialEq,Eq)]
-pub enum FilterVerdict
-{
+
+extern crate alloc;
+use alloc::vec::Vec;
+
+use smoltcp::wire::{
+    EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
+};
+
+pub const MAX_RULES: usize = 1024;
+const BV_WORDS: usize = MAX_RULES / 64; 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitVector1024 {
+    pub bits: [u64; BV_WORDS],
+}
+
+impl BitVector1024 {
+    pub const fn zero() -> Self {
+        Self { bits: [0; BV_WORDS] }
+    }
+
+    pub const fn ones() -> Self {
+        Self { bits: [!0; BV_WORDS] }
+    }
+
+    #[inline(always)]
+    pub fn set_bit(&mut self, idx: usize) {
+        if idx < MAX_RULES {
+            self.bits[idx / 64] |= 1u64 << (idx % 64);
+        }
+    }
+
+    #[inline(always)]
+    pub fn and(&self, other: &Self) -> Self {
+        let mut res = Self::zero();
+        for i in 0..BV_WORDS {
+            res.bits[i] = self.bits[i] & other.bits[i];
+        }
+        res
+    }
+
+    #[inline(always)]
+    pub fn is_zero(&self) -> bool {
+        self.bits.iter().all(|&w| w == 0)
+    }
+
+    #[inline(always)]
+    pub fn find_first_set(&self) -> Option<usize> {
+        for (i, &word) in self.bits.iter().enumerate() {
+            if word != 0 {
+                return Some(i * 64 + word.trailing_zeros() as usize);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterVerdict {
     Accept,
     Drop,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L4Protocol {
     Tcp,
@@ -13,6 +69,7 @@ pub enum L4Protocol {
     Icmp,
     Other(u8),
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PacketInfo {
     pub src_ip: Ipv4Address,
@@ -21,6 +78,7 @@ pub struct PacketInfo {
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
 }
+
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub proto: Option<L4Protocol>,
@@ -29,34 +87,145 @@ pub struct Rule {
     pub dst_port: Option<u16>,
     pub verdict: FilterVerdict,
 }
-impl Rule {
-    pub fn matches(&self, pkt: &PacketInfo) -> bool {
-        if let Some(proto) = self.proto {
-            if proto != pkt.proto {
-                return false;
+
+/// LBVS 多维规则索引表
+pub struct LbvsEngine {
+    pub rules: Vec<Rule>,
+    pub default_policy: FilterVerdict,
+
+    // 各维度的映射表与通配符位向量
+    proto_wildcard: BitVector1024,
+    proto_tcp: BitVector1024,
+    proto_udp: BitVector1024,
+    proto_icmp: BitVector1024,
+
+    dst_port_wildcard: BitVector1024,
+    dst_port_entries: Vec<(u16, BitVector1024)>,
+
+    dst_ip_wildcard: BitVector1024,
+    dst_ip_entries: Vec<(Ipv4Address, BitVector1024)>,
+}
+
+impl LbvsEngine {
+    pub fn new(default_policy: FilterVerdict) -> Self {
+        Self {
+            rules: Vec::new(),
+            default_policy,
+            proto_wildcard: BitVector1024::zero(),
+            proto_tcp: BitVector1024::zero(),
+            proto_udp: BitVector1024::zero(),
+            proto_icmp: BitVector1024::zero(),
+            dst_port_wildcard: BitVector1024::zero(),
+            dst_port_entries: Vec::new(),
+            dst_ip_wildcard: BitVector1024::zero(),
+            dst_ip_entries: Vec::new(),
+        }
+    }
+
+    /// 编译/重建 LBVS 矩阵
+    pub fn build(&mut self) {
+        self.proto_wildcard = BitVector1024::zero();
+        self.proto_tcp = BitVector1024::zero();
+        self.proto_udp = BitVector1024::zero();
+        self.proto_icmp = BitVector1024::zero();
+
+        self.dst_port_wildcard = BitVector1024::zero();
+        self.dst_port_entries.clear();
+
+        self.dst_ip_wildcard = BitVector1024::zero();
+        self.dst_ip_entries.clear();
+
+        for (idx, rule) in self.rules.iter().enumerate().take(MAX_RULES) {
+            match rule.proto {
+                None => self.proto_wildcard.set_bit(idx),
+                Some(L4Protocol::Tcp) => self.proto_tcp.set_bit(idx),
+                Some(L4Protocol::Udp) => self.proto_udp.set_bit(idx),
+                Some(L4Protocol::Icmp) => self.proto_icmp.set_bit(idx),
+                Some(L4Protocol::Other(_)) => {}
+            }
+
+            match rule.dst_port {
+                None => self.dst_port_wildcard.set_bit(idx),
+                Some(port) => {
+                    if let Some(entry) = self.dst_port_entries.iter_mut().find(|(p, _)| *p == port) {
+                        entry.1.set_bit(idx);
+                    } else {
+                        let mut bv = BitVector1024::zero();
+                        bv.set_bit(idx);
+                        self.dst_port_entries.push((port, bv));
+                    }
+                }
+            }
+
+            match rule.dst_ip {
+                None => self.dst_ip_wildcard.set_bit(idx),
+                Some(ip) => {
+                    if let Some(entry) = self.dst_ip_entries.iter_mut().find(|(i, _)| *i == ip) {
+                        entry.1.set_bit(idx);
+                    } else {
+                        let mut bv = BitVector1024::zero();
+                        bv.set_bit(idx);
+                        self.dst_ip_entries.push((ip, bv));
+                    }
+                }
             }
         }
-        if let Some(src_ip) = self.src_ip {
-            if src_ip != pkt.src_ip {
-                return false;
+    }
+
+    /// LBVS 报文分类主流程
+    pub fn classify(&self, pkt: &PacketInfo) -> FilterVerdict {
+        let mut tmp_bv = BitVector1024::ones();
+
+        let mut port_bv = self.dst_port_wildcard;
+        if let Some(dport) = pkt.dst_port {
+            if let Some((_, bv)) = self.dst_port_entries.iter().find(|(p, _)| *p == dport) {
+                for i in 0..BV_WORDS {
+                    port_bv.bits[i] |= bv.bits[i];
+                }
             }
         }
-        if let Some(dst_ip) = self.dst_ip {
-            if dst_ip != pkt.dst_ip {
-                return false;
+        tmp_bv = tmp_bv.and(&port_bv);
+        if tmp_bv.is_zero() {
+            return self.default_policy;
+        }
+
+        let mut proto_bv = self.proto_wildcard;
+        let specific_proto_bv = match pkt.proto {
+            L4Protocol::Tcp => &self.proto_tcp,
+            L4Protocol::Udp => &self.proto_udp,
+            L4Protocol::Icmp => &self.proto_icmp,
+            L4Protocol::Other(_) => &BitVector1024::zero(),
+        };
+        for i in 0..BV_WORDS {
+            proto_bv.bits[i] |= specific_proto_bv.bits[i];
+        }
+        tmp_bv = tmp_bv.and(&proto_bv);
+        if tmp_bv.is_zero() {
+            return self.default_policy;
+        }
+
+        let mut ip_bv = self.dst_ip_wildcard;
+        if let Some((_, bv)) = self.dst_ip_entries.iter().find(|(ip, _)| *ip == pkt.dst_ip) {
+            for i in 0..BV_WORDS {
+                ip_bv.bits[i] |= bv.bits[i];
             }
         }
-        if let Some(dst_port) = self.dst_port {
-            if pkt.dst_port != Some(dst_port) {
-                return false;
-            }
+        tmp_bv = tmp_bv.and(&ip_bv);
+        if tmp_bv.is_zero() {
+            return self.default_policy;
         }
-        true
+
+        if let Some(rule_idx) = tmp_bv.find_first_set() {
+            self.rules[rule_idx].verdict
+        } else {
+            self.default_policy
+        }
     }
 }
+
+/// 零拷贝报文解析
 pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     let eth_frame = EthernetFrame::new_checked(raw_pkt).ok()?;
-
     if eth_frame.ethertype() != EthernetProtocol::Ipv4 {
         return None;
     }
@@ -94,38 +263,43 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
         dst_port,
     })
 }
-pub fn match_rules(pkt: &PacketInfo) -> FilterVerdict {
-    let rules = [
-        Rule {
+
+fn get_test_engine() -> LbvsEngine {
+    let mut engine = LbvsEngine::new(FilterVerdict::Accept);
+
+    for p in 8000..8050 {
+        engine.rules.push(Rule {
             proto: Some(L4Protocol::Tcp),
             src_ip: None,
             dst_ip: None,
-            dst_port: Some(5555),
-            verdict: FilterVerdict::Drop,
-        },
-    ];
-
-    for rule in &rules {
-        if rule.matches(pkt) {
-            return rule.verdict;
-        }
+            dst_port: Some(p),
+            verdict: FilterVerdict::Accept,
+        });
     }
 
-    FilterVerdict::Accept
+    engine.rules.push(Rule {
+        proto: Some(L4Protocol::Tcp),
+        src_ip: None,
+        dst_ip: None,
+        dst_port: Some(5555),
+        verdict: FilterVerdict::Drop,
+    });
+
+    engine.build();
+    engine
 }
-pub fn filter_rx_packet(raw_pkt:&[u8])->FilterVerdict
-{
+
+pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     let pkt_info = match parse_packet(raw_pkt) {
         Some(info) => info,
-        None => {
-            return FilterVerdict::Accept;
-        }
+        None => return FilterVerdict::Accept,
     };
 
-    let verdict = match_rules(&pkt_info);
+    let engine = get_test_engine();
+    let verdict = engine.classify(&pkt_info);
 
     log::info!(
-        "[axfirewall] {:?} {}:{} -> {}:{} => {:?}",
+        "[axfirewall-lbvs] {:?} {}:{} -> {}:{} => {:?}",
         pkt_info.proto,
         pkt_info.src_ip,
         pkt_info.src_port.unwrap_or(0),

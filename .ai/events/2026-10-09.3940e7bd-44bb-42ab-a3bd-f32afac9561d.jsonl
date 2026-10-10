@@ -1,0 +1,3 @@
+{"schema":"course-log-v1","id":"6b545137-a4c0-4cad-8c8f-7be95822c9ed","timestamp":"2026-10-09T07:16:48.647Z","session":"3940e7bd-44bb-42ab-a3bd-f32afac9561d","type":"session_start","actor":"system","source":"vscode"}
+{"schema":"course-log-v1","id":"39e1c866-c75e-42e1-a28e-8cab96d6a681","timestamp":"2026-10-09T07:20:50.334Z","session":"3940e7bd-44bb-42ab-a3bd-f32afac9561d","type":"file_open","actor":"unknown","source":"vscode","file":"src/lib.rs","language":"rust"}
+{"schema":"course-log-v1","id":"a5bb0ff5-ced5-406f-9e28-237b7cb02063","timestamp":"2026-10-09T14:24:56.550Z","session":"3940e7bd-44bb-42ab-a3bd-f32afac9561d","type":"session_end","actor":"system","source":"vscode","reason":"workspace_closed"}
