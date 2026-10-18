@@ -8,8 +8,9 @@ use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
 };
 
-pub mod bench;
 pub mod linear;
+pub mod conntrack;
+use conntrack::{ConntrackTable, FlowKey};
 
 pub const MAX_RULES: usize = 1024;
 const BV_WORDS: usize = MAX_RULES / 64; 
@@ -82,6 +83,8 @@ pub struct PacketInfo {
     pub proto: L4Protocol,
     pub src_port: Option<u16>,
     pub dst_port: Option<u16>,
+    pub is_syn: bool,
+    pub is_fin_or_rst: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -257,14 +260,13 @@ pub fn init_firewall() {
         src_ip: None,
         dst_ip: None,
         dst_port: Some(5555),
-        verdict: FilterVerdict::Drop,
+        verdict: FilterVerdict::Accept,
     });
 
     engine.build();
     *FIREWALL_ENGINE.lock() = Some(engine);
     log::info!("[axfirewall] Global RuleManager initialized with Hash-LBVS!");
 
-    bench::run_evaluation();
 }
 
 pub fn add_rule(rule: Rule) {
@@ -296,24 +298,26 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     let dst_ip = ipv4_packet.dst_addr();
     let payload = ipv4_packet.payload();
 
-    let (proto, src_port, dst_port) = match ipv4_packet.next_header() {
+    let (proto, src_port, dst_port, is_syn, is_fin_or_rst) = match ipv4_packet.next_header() {
         IpProtocol::Tcp => {
             if let Ok(tcp) = TcpPacket::new_checked(payload) {
-                (L4Protocol::Tcp, Some(tcp.src_port()), Some(tcp.dst_port()))
+                let syn = tcp.syn();
+                let fin_rst = tcp.fin() || tcp.rst();
+                (L4Protocol::Tcp, Some(tcp.src_port()), Some(tcp.dst_port()), syn, fin_rst)
             } else {
-                (L4Protocol::Tcp, None, None)
+                (L4Protocol::Tcp, None, None, false, false)
             }
         }
         IpProtocol::Udp => {
             if let Ok(udp) = UdpPacket::new_checked(payload) {
-                (L4Protocol::Udp, Some(udp.src_port()), Some(udp.dst_port()))
+                (L4Protocol::Udp, Some(udp.src_port()), Some(udp.dst_port()), false, false)
             } else {
-                (L4Protocol::Udp, None, None)
+                (L4Protocol::Udp, None, None, false, false)
             }
         }
-        IpProtocol::Icmp => (L4Protocol::Icmp, None, None),
-        IpProtocol::Unknown(val) => (L4Protocol::Other(val), None, None),
-        _ => (L4Protocol::Other(0), None, None),
+        IpProtocol::Icmp => (L4Protocol::Icmp, None, None, false, false),
+        IpProtocol::Unknown(val) => (L4Protocol::Other(val), None, None, false, false),
+        _ => (L4Protocol::Other(0), None, None, false, false),
     };
 
     Some(PacketInfo {
@@ -322,14 +326,28 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
         proto,
         src_port,
         dst_port,
+        is_syn,
+        is_fin_or_rst,
     })
 }
+
+pub static CONNTRACK_TABLE: Mutex<ConntrackTable> = Mutex::new(ConntrackTable::new());
 
 pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     let pkt_info = match parse_packet(raw_pkt) {
         Some(info) => info,
         None => return FilterVerdict::Accept,
     };
+    let flow_key = FlowKey::from_packet(&pkt_info);
+
+    if let Some(ref key) = flow_key {
+        let mut ct = CONNTRACK_TABLE.lock();
+        if ct.is_established(key) {
+            ct.track_packet(*key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst);
+            log::info!("[axfirewall-fastpath] BYPASS: 已建连流直通放行 -> dst_port={:?}", pkt_info.dst_port);
+            return FilterVerdict::Accept;
+        }
+    }
 
     let mut lock = FIREWALL_ENGINE.lock();
     if lock.is_none() {
@@ -353,6 +371,10 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
             pkt_info.dst_ip,
             pkt_info.dst_port.unwrap_or(0),
         );
+    } else if let Some(key) = flow_key {
+        log::info!("[axfirewall-slowpath] ACCEPT: 首包/未建连包经 LBVS 查表放行并登记 Conntrack");
+        let mut ct = CONNTRACK_TABLE.lock();
+        ct.track_packet(key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst);
     }
 
     verdict
