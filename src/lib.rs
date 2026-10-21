@@ -333,18 +333,28 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
 
 pub static CONNTRACK_TABLE: Mutex<ConntrackTable> = Mutex::new(ConntrackTable::new());
 
+fn get_current_time_secs() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_rdtsc() / 2_000_000_000
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
 pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     let pkt_info = match parse_packet(raw_pkt) {
         Some(info) => info,
         None => return FilterVerdict::Accept,
     };
+
     let flow_key = FlowKey::from_packet(&pkt_info);
+    let now = get_current_time_secs();
 
     if let Some(ref key) = flow_key {
         let mut ct = CONNTRACK_TABLE.lock();
         if ct.is_established(key) {
-            ct.track_packet(*key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst);
-            log::info!("[axfirewall-fastpath] BYPASS: 已建连流直通放行 -> dst_port={:?}", pkt_info.dst_port);
+            ct.track_packet(*key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst, now);
             return FilterVerdict::Accept;
         }
     }
@@ -372,10 +382,29 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
             pkt_info.dst_port.unwrap_or(0),
         );
     } else if let Some(key) = flow_key {
-        log::info!("[axfirewall-slowpath] ACCEPT: 首包/未建连包经 LBVS 查表放行并登记 Conntrack");
         let mut ct = CONNTRACK_TABLE.lock();
-        ct.track_packet(key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst);
+        ct.track_packet(key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst, now);
+        if ct.entries.len() % 64 == 0 {
+            ct.gc_expired(now);
+        }
     }
 
     verdict
+}
+
+pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
+    let pkt_info = match parse_packet(raw_pkt) {
+        Some(info) => info,
+        None => return FilterVerdict::Accept,
+    };
+
+    let flow_key = FlowKey::from_packet(&pkt_info);
+    let now = get_current_time_secs();
+
+    if let Some(key) = flow_key {
+        let mut ct = CONNTRACK_TABLE.lock();
+        ct.track_packet(key, pkt_info.proto == L4Protocol::Tcp, pkt_info.is_syn, pkt_info.is_fin_or_rst, now);
+    }
+
+    FilterVerdict::Accept
 }

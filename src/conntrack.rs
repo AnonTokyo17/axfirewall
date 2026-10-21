@@ -2,6 +2,10 @@ use alloc::collections::BTreeMap;
 use smoltcp::wire::Ipv4Address;
 use crate::{L4Protocol, PacketInfo};
 
+const TCP_ESTABLISHED_TIMEOUT_SECS: u64 = 300;
+const TCP_CLOSING_TIMEOUT_SECS: u64 = 10;
+const GENERIC_TIMEOUT_SECS: u64 = 60;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FlowKey {
     pub ip_min: Ipv4Address,
@@ -60,6 +64,7 @@ pub enum FlowState {
 pub struct ConnEntry {
     pub state: FlowState,
     pub packets_seen: u64,
+    pub last_seen_secs: u64,
 }
 
 pub struct ConntrackTable {
@@ -77,7 +82,9 @@ impl ConntrackTable {
     pub fn is_established(&self, key: &FlowKey) -> bool {
         if let Some(entry) = self.entries.get(key) {
             match entry.state {
-                FlowState::Tcp(TcpConnState::Established) | FlowState::Tcp(TcpConnState::Closing) | FlowState::Generic => true,
+                FlowState::Tcp(TcpConnState::Established)
+                | FlowState::Tcp(TcpConnState::Closing)
+                | FlowState::Generic => true,
                 _ => false,
             }
         } else {
@@ -85,20 +92,33 @@ impl ConntrackTable {
         }
     }
 
-    pub fn track_packet(&mut self, key: FlowKey, is_tcp: bool, is_syn: bool, is_fin_or_rst: bool) {
+    pub fn track_packet(&mut self, key: FlowKey, is_tcp: bool, is_syn: bool, is_fin_or_rst: bool, now_secs: u64) {
         let entry = self.entries.entry(key).or_insert_with(|| {
             if is_tcp {
                 if is_syn {
-                    ConnEntry { state: FlowState::Tcp(TcpConnState::SynSent), packets_seen: 0 }
+                    ConnEntry {
+                        state: FlowState::Tcp(TcpConnState::SynSent),
+                        packets_seen: 0,
+                        last_seen_secs: now_secs,
+                    }
                 } else {
-                    ConnEntry { state: FlowState::Tcp(TcpConnState::Established), packets_seen: 0 }
+                    ConnEntry {
+                        state: FlowState::Tcp(TcpConnState::Established),
+                        packets_seen: 0,
+                        last_seen_secs: now_secs,
+                    }
                 }
             } else {
-                ConnEntry { state: FlowState::Generic, packets_seen: 0 }
+                ConnEntry {
+                    state: FlowState::Generic,
+                    packets_seen: 0,
+                    last_seen_secs: now_secs,
+                }
             }
         });
 
         entry.packets_seen += 1;
+        entry.last_seen_secs = now_secs;
 
         if is_tcp {
             if let FlowState::Tcp(ref mut tcp_state) = entry.state {
@@ -111,10 +131,15 @@ impl ConntrackTable {
         }
     }
 
-    pub fn purge_closing(&mut self) {
-        self.entries.retain(|_, v| match v.state {
-            FlowState::Tcp(TcpConnState::Closing) => false,
-            _ => true,
+    pub fn gc_expired(&mut self, now_secs: u64) {
+        self.entries.retain(|_, entry| {
+            let timeout = match entry.state {
+                FlowState::Tcp(TcpConnState::Established) => TCP_ESTABLISHED_TIMEOUT_SECS,
+                FlowState::Tcp(TcpConnState::Closing) => TCP_CLOSING_TIMEOUT_SECS,
+                FlowState::Tcp(TcpConnState::SynSent) => 10,
+                FlowState::Generic => GENERIC_TIMEOUT_SECS,
+            };
+            now_secs.saturating_sub(entry.last_seen_secs) < timeout
         });
     }
 }
