@@ -92,7 +92,14 @@ impl ConntrackTable {
         }
     }
 
-    pub fn track_packet(&mut self, key: FlowKey, is_tcp: bool, is_syn: bool, is_fin_or_rst: bool, now_secs: u64) {
+    pub fn track_packet(
+        &mut self,
+        key: FlowKey,
+        is_tcp: bool,
+        is_syn: bool,
+        is_fin_or_rst: bool,
+        now_secs: u64,
+    ) {
         let entry = self.entries.entry(key).or_insert_with(|| {
             if is_tcp {
                 if is_syn {
@@ -124,7 +131,7 @@ impl ConntrackTable {
             if let FlowState::Tcp(ref mut tcp_state) = entry.state {
                 if is_fin_or_rst {
                     *tcp_state = TcpConnState::Closing;
-                } else if *tcp_state == TcpConnState::SynSent && !is_syn {
+                } else if *tcp_state == TcpConnState::SynSent && entry.packets_seen > 1 {
                     *tcp_state = TcpConnState::Established;
                 }
             }
