@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod conntrack;
+pub mod parser;
 
 use alloc::string::String;
 use alloc::vec;
@@ -28,6 +29,20 @@ pub enum L4Protocol {
 pub enum FilterVerdict {
     Accept,
     Drop,
+    LogAccept,
+    LogDrop,
+}
+
+impl FilterVerdict {
+    #[inline(always)]
+    pub fn is_drop(&self) -> bool {
+        matches!(self, FilterVerdict::Drop | FilterVerdict::LogDrop)
+    }
+
+    #[inline(always)]
+    pub fn should_log(&self) -> bool {
+        matches!(self, FilterVerdict::LogAccept | FilterVerdict::LogDrop)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,62 +112,10 @@ pub struct PacketInfo {
 pub struct Rule {
     pub direction: Option<Direction>,
     pub proto: Option<L4Protocol>,
-    pub src_ip: Option<Ipv4Address>,
-    pub dst_ip: Option<Ipv4Address>,
     pub src_cidr: Option<Ipv4Cidr>,
     pub dst_cidr: Option<Ipv4Cidr>,
     pub dst_port: Option<u16>,
     pub verdict: FilterVerdict,
-}
-
-impl Rule {
-    pub fn new_in(
-        proto: Option<L4Protocol>,
-        src_cidr: Option<Ipv4Cidr>,
-        dst_cidr: Option<Ipv4Cidr>,
-        dst_port: Option<u16>,
-        verdict: FilterVerdict,
-    ) -> Self {
-        Self {
-            direction: Some(Direction::Inbound),
-            proto,
-            src_ip: None,
-            dst_ip: None,
-            src_cidr,
-            dst_cidr,
-            dst_port,
-            verdict,
-        }
-    }
-
-    pub fn new_out(
-        proto: Option<L4Protocol>,
-        src_cidr: Option<Ipv4Cidr>,
-        dst_cidr: Option<Ipv4Cidr>,
-        dst_port: Option<u16>,
-        verdict: FilterVerdict,
-    ) -> Self {
-        Self {
-            direction: Some(Direction::Outbound),
-            proto,
-            src_ip: None,
-            dst_ip: None,
-            src_cidr,
-            dst_cidr,
-            dst_port,
-            verdict,
-        }
-    }
-
-    #[inline(always)]
-    pub fn effective_src_cidr(&self) -> Option<Ipv4Cidr> {
-        self.src_cidr.or_else(|| self.src_ip.map(Ipv4Cidr::single))
-    }
-
-    #[inline(always)]
-    pub fn effective_dst_cidr(&self) -> Option<Ipv4Cidr> {
-        self.dst_cidr.or_else(|| self.dst_ip.map(Ipv4Cidr::single))
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,7 +335,7 @@ impl LbvsEngine {
                 self.dst_port_wildcard.set_bit(idx);
             }
 
-            if let Some(cidr) = rule.effective_dst_cidr() {
+            if let Some(cidr) = rule.dst_cidr {
                 let net_u32 = cidr.network_u32();
                 let plen = cidr.prefix_len;
                 if !self.active_dst_prefixes.contains(&plen) {
@@ -391,7 +354,7 @@ impl LbvsEngine {
                 self.dst_ip_wildcard.set_bit(idx);
             }
 
-            if let Some(cidr) = rule.effective_src_cidr() {
+            if let Some(cidr) = rule.src_cidr {
                 let net_u32 = cidr.network_u32();
                 let plen = cidr.prefix_len;
                 if !self.active_src_prefixes.contains(&plen) {
@@ -410,11 +373,6 @@ impl LbvsEngine {
                 self.src_ip_wildcard.set_bit(idx);
             }
         }
-    }
-
-    #[inline(always)]
-    pub fn classify(&self, pkt: &PacketInfo) -> FilterVerdict {
-        self.classify_dir(pkt, Direction::Inbound)
     }
 
     #[inline(always)]
@@ -570,47 +528,61 @@ fn get_current_time_secs() -> u64 {
     }
 }
 
+pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let action = parts.next().ok_or("Empty command")?;
+
+    match action {
+        "status" => Ok(dump_status()),
+        "flush" => {
+            let mut lock = FIREWALL_ENGINE.lock();
+            if let Some(ref mut engine) = *lock {
+                engine.rules.clear();
+                engine.build();
+            }
+            Ok(String::from("All firewall rules flushed successfully.\n"))
+        }
+        "del" => {
+            let idx_str = parts.next().ok_or("Missing rule index")?;
+            let idx = idx_str.parse::<usize>().map_err(|_| "Invalid rule index")?;
+            let mut lock = FIREWALL_ENGINE.lock();
+            if let Some(ref mut engine) = *lock {
+                if idx < engine.rules.len() {
+                    engine.rules.remove(idx);
+                    engine.build();
+                    Ok(String::from("Rule removed.\n"))
+                } else {
+                    Err("Rule index out of range")
+                }
+            } else {
+                Err("Firewall engine not initialized")
+            }
+        }
+        "add" => {
+            let rule = parser::parse_rule_cmd(trimmed).map_err(|_| "Failed to parse add rule")?;
+            let mut lock = FIREWALL_ENGINE.lock();
+            if lock.is_none() {
+                *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
+            }
+            if let Some(ref mut engine) = *lock {
+                engine.rules.push(rule);
+                engine.build();
+            }
+            Ok(String::from("Rule added successfully.\n"))
+        }
+        _ => Err("Unknown command, supported: status, flush, del <idx>, add <rule>"),
+    }
+}
+
 pub fn init_firewall() {
-    let mut engine = LbvsEngine::new(FilterVerdict::Accept);
-
-    engine.rules.push(Rule::new_in(
-        Some(L4Protocol::Tcp),
-        Some(Ipv4Cidr::new(Ipv4Address::new(10, 0, 2, 0), 24)),
-        None,
-        Some(5555),
-        FilterVerdict::Accept,
-    ));
-
-    engine.rules.push(Rule::new_in(
-        Some(L4Protocol::Tcp),
-        None,
-        None,
-        Some(9999),
-        FilterVerdict::Drop,
-    ));
-
-    engine.build();
-    *FIREWALL_ENGINE.lock() = Some(engine);
-    log::info!("[axfirewall] Initialized with Direction, CIDR & Hit-Counter support!");
-}
-
-pub fn add_rule(rule: Rule) {
-    let mut lock = FIREWALL_ENGINE.lock();
-    if lock.is_none() {
-        *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
-    }
-    if let Some(ref mut engine) = *lock {
-        engine.rules.push(rule);
-        engine.build();
-    }
-}
-
-pub fn flush_rules() {
-    let mut lock = FIREWALL_ENGINE.lock();
-    if let Some(ref mut engine) = *lock {
-        engine.rules.clear();
-        engine.build();
-    }
+    let _ = execute_cmd("add in accept tcp 10.0.2.0/24 any 5555");
+    let _ = execute_cmd("add in drop tcp any any 9999");
+    log::info!("[axfirewall] Initialized via unified Control Plane API!");
 }
 
 pub fn dump_status() -> String {
@@ -654,7 +626,7 @@ pub fn dump_status() -> String {
                 idx,
                 dir_str,
                 r.proto,
-                r.effective_src_cidr(),
+                r.src_cidr,
                 r.dst_port,
                 r.verdict,
                 hits
@@ -716,7 +688,19 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     };
     drop(lock);
 
-    if verdict == FilterVerdict::Drop {
+    if verdict.should_log() {
+        log::info!(
+            "[axfirewall-audit] IN: {:?} {:?} {}:{} -> {}:{}",
+            verdict,
+            pkt_info.proto,
+            pkt_info.src_ip,
+            pkt_info.src_port.unwrap_or(0),
+            pkt_info.dst_ip,
+            pkt_info.dst_port.unwrap_or(0),
+        );
+    }
+
+    if verdict.is_drop() {
         FIREWALL_STATS.rx_dropped.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "[axfirewall-lbvs] DROP IN: {:?} {}:{} -> {}:{}",
@@ -784,7 +768,19 @@ pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     };
     drop(lock);
 
-    if verdict == FilterVerdict::Drop {
+    if verdict.should_log() {
+        log::info!(
+            "[axfirewall-audit] OUT: {:?} {:?} {}:{} -> {}:{}",
+            verdict,
+            pkt_info.proto,
+            pkt_info.src_ip,
+            pkt_info.src_port.unwrap_or(0),
+            pkt_info.dst_ip,
+            pkt_info.dst_port.unwrap_or(0),
+        );
+    }
+
+    if verdict.is_drop() {
         FIREWALL_STATS.tx_dropped.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "[axfirewall-lbvs] DROP OUT: {:?} {}:{} -> {}:{}",
