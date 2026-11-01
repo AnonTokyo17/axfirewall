@@ -17,7 +17,7 @@ pub fn parse_rule_cmd(cmd: &str) -> Result<Rule, ParseError> {
         return Err(ParseError::TooFewArguments);
     }
 
-    if parts[0] != "add" {
+    if parts[0] != "add" && parts[0] != "insert" {
         return Err(ParseError::InvalidCommand);
     }
 

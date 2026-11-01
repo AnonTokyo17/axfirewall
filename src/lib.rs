@@ -545,7 +545,8 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
                 engine.rules.clear();
                 engine.build();
             }
-            Ok(String::from("All firewall rules flushed successfully.\n"))
+            CONNTRACK_TABLE.lock().entries.clear();
+            Ok(String::from("All firewall rules flushed and conntrack cleared.\n"))
         }
         "del" => {
             let idx_str = parts.next().ok_or("Missing rule index")?;
@@ -563,8 +564,37 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
                 Err("Firewall engine not initialized")
             }
         }
+        "insert" => {
+            let idx_str = parts.next().ok_or("Missing insert index")?;
+            let idx = idx_str.parse::<usize>().map_err(|_| "Invalid insert index")?;
+
+            let rule_tokens: alloc::vec::Vec<&str> = parts.collect();
+            if rule_tokens.len() < 6 {
+                return Err("Too few arguments for rule. Usage: insert <idx> <in|out> <verdict> <proto> <src_cidr> <dst_cidr> <port>");
+            }
+            let reconstructed = alloc::format!("insert {}", rule_tokens.join(" "));
+            let rule = parser::parse_rule_cmd(&reconstructed).map_err(|_| "Failed to parse insert rule")?;
+
+            let is_drop = rule.verdict.is_drop();
+            let mut lock = FIREWALL_ENGINE.lock();
+            if lock.is_none() {
+                *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
+            }
+            if let Some(ref mut engine) = *lock {
+                let target_idx = if idx > engine.rules.len() { engine.rules.len() } else { idx };
+                engine.rules.insert(target_idx, rule);
+                engine.build();
+            }
+
+            if is_drop {
+                CONNTRACK_TABLE.lock().entries.clear();
+            }
+
+            Ok(String::from("Rule inserted successfully.\n"))
+        }
         "add" => {
             let rule = parser::parse_rule_cmd(trimmed).map_err(|_| "Failed to parse add rule")?;
+            let is_drop = rule.verdict.is_drop();
             let mut lock = FIREWALL_ENGINE.lock();
             if lock.is_none() {
                 *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
@@ -573,9 +603,14 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
                 engine.rules.push(rule);
                 engine.build();
             }
+
+            if is_drop {
+                CONNTRACK_TABLE.lock().entries.clear();
+            }
+
             Ok(String::from("Rule added successfully.\n"))
         }
-        _ => Err("Unknown command, supported: status, flush, del <idx>, add <rule>"),
+        _ => Err("Unknown command, supported: status, flush, del <idx>, insert <idx> <rule>, add <rule>"),
     }
 }
 
