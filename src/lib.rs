@@ -4,6 +4,8 @@ extern crate alloc;
 
 pub mod conntrack;
 pub mod parser;
+pub mod config;
+pub mod inspector;
 
 use alloc::string::String;
 use alloc::vec;
@@ -106,6 +108,7 @@ pub struct PacketInfo {
     pub dst_port: Option<u16>,
     pub is_syn: bool,
     pub is_fin_or_rst: bool,
+    pub is_anomaly: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -471,18 +474,21 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     let dst_ip = ipv4_packet.dst_addr();
     let payload = ipv4_packet.payload();
 
-    let (proto, src_port, dst_port, is_syn, is_fin_or_rst) = match ipv4_packet.next_header() {
+    let (proto, src_port, dst_port, is_syn, is_fin_or_rst, is_anomaly) = match ipv4_packet.next_header() {
         IpProtocol::Tcp => {
             if let Ok(tcp) = TcpPacket::new_checked(payload) {
+                let anomaly_verdict = inspector::inspect_tcp(&tcp);
+                let is_anomaly = anomaly_verdict.is_drop();
                 (
                     L4Protocol::Tcp,
                     Some(tcp.src_port()),
                     Some(tcp.dst_port()),
                     tcp.syn() && !tcp.ack(),
                     tcp.fin() || tcp.rst(),
+                    is_anomaly,
                 )
             } else {
-                (L4Protocol::Tcp, None, None, false, false)
+                (L4Protocol::Tcp, None, None, false, false, false)
             }
         }
         IpProtocol::Udp => {
@@ -493,14 +499,15 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
                     Some(udp.dst_port()),
                     false,
                     false,
+                    false,
                 )
             } else {
-                (L4Protocol::Udp, None, None, false, false)
+                (L4Protocol::Udp, None, None, false, false, false)
             }
         }
-        IpProtocol::Icmp => (L4Protocol::Icmp, None, None, false, false),
-        IpProtocol::Unknown(val) => (L4Protocol::Other(val), None, None, false, false),
-        _ => (L4Protocol::Other(0), None, None, false, false),
+        IpProtocol::Icmp => (L4Protocol::Icmp, None, None, false, false, false),
+        IpProtocol::Unknown(val) => (L4Protocol::Other(val), None, None, false, false, false),
+        _ => (L4Protocol::Other(0), None, None, false, false, false),
     };
 
     Some(PacketInfo {
@@ -511,6 +518,7 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
         dst_port,
         is_syn,
         is_fin_or_rst,
+        is_anomaly,
     })
 }
 
@@ -534,55 +542,54 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
         return Ok(String::new());
     }
 
-    let mut parts = trimmed.split_whitespace();
-    let action = parts.next().ok_or("Empty command")?;
-
-    match action {
-        "status" => Ok(dump_status()),
-        "flush" => {
-            let mut lock = FIREWALL_ENGINE.lock();
-            if let Some(ref mut engine) = *lock {
-                engine.rules.clear();
-                engine.build();
-            }
-            CONNTRACK_TABLE.lock().entries.clear();
-            Ok(String::from("All firewall rules flushed and conntrack cleared.\n"))
+    if trimmed == "flush" || trimmed == "iptables -F" || trimmed == "-F" {
+        let mut lock = FIREWALL_ENGINE.lock();
+        if let Some(ref mut engine) = *lock {
+            engine.rules.clear();
+            engine.build();
         }
-        "del" => {
-            let idx_str = parts.next().ok_or("Missing rule index")?;
-            let idx = idx_str.parse::<usize>().map_err(|_| "Invalid rule index")?;
-            let mut lock = FIREWALL_ENGINE.lock();
-            if let Some(ref mut engine) = *lock {
-                if idx < engine.rules.len() {
-                    engine.rules.remove(idx);
-                    engine.build();
-                    Ok(String::from("Rule removed.\n"))
-                } else {
-                    Err("Rule index out of range")
-                }
+        CONNTRACK_TABLE.lock().entries.clear();
+        inspector::ANOMALY_STATS.reset();
+        return Ok(String::from("Firewall rules flushed and conntrack cleared.\n"));
+    }
+
+    if trimmed == "status" || trimmed == "iptables -L" || trimmed == "-L" {
+        return Ok(dump_status());
+    }
+
+    if trimmed.starts_with("del ") || trimmed.starts_with("iptables -D ") || trimmed.starts_with("-D ") {
+        let tokens: alloc::vec::Vec<&str> = trimmed.split_whitespace().collect();
+        let idx_str = tokens.last().ok_or("Missing rule index")?;
+        let raw_idx = idx_str.parse::<usize>().map_err(|_| "Invalid rule index")?;
+        let idx = if trimmed.contains("-D") { raw_idx.saturating_sub(1) } else { raw_idx };
+
+        let mut lock = FIREWALL_ENGINE.lock();
+        if let Some(ref mut engine) = *lock {
+            if idx < engine.rules.len() {
+                engine.rules.remove(idx);
+                engine.build();
+                return Ok(String::from("Rule removed.\n"));
             } else {
-                Err("Firewall engine not initialized")
+                return Err("Rule index out of range");
             }
         }
-        "insert" => {
-            let idx_str = parts.next().ok_or("Missing insert index")?;
-            let idx = idx_str.parse::<usize>().map_err(|_| "Invalid insert index")?;
+        return Err("Firewall engine not initialized");
+    }
 
-            let rule_tokens: alloc::vec::Vec<&str> = parts.collect();
-            if rule_tokens.len() < 6 {
-                return Err("Too few arguments for rule. Usage: insert <idx> <in|out> <verdict> <proto> <src_cidr> <dst_cidr> <port>");
-            }
-            let reconstructed = alloc::format!("insert {}", rule_tokens.join(" "));
-            let rule = parser::parse_rule_cmd(&reconstructed).map_err(|_| "Failed to parse insert rule")?;
-
+    match parser::parse_rule_cmd(trimmed) {
+        Ok((insert_idx, rule)) => {
             let is_drop = rule.verdict.is_drop();
             let mut lock = FIREWALL_ENGINE.lock();
             if lock.is_none() {
                 *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
             }
             if let Some(ref mut engine) = *lock {
-                let target_idx = if idx > engine.rules.len() { engine.rules.len() } else { idx };
-                engine.rules.insert(target_idx, rule);
+                if let Some(idx) = insert_idx {
+                    let target = if idx > engine.rules.len() { engine.rules.len() } else { idx };
+                    engine.rules.insert(target, rule);
+                } else {
+                    engine.rules.push(rule);
+                }
                 engine.build();
             }
 
@@ -590,34 +597,33 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
                 CONNTRACK_TABLE.lock().entries.clear();
             }
 
-            Ok(String::from("Rule inserted successfully.\n"))
+            Ok(String::from("Rule applied successfully.\n"))
         }
-        "add" => {
-            let rule = parser::parse_rule_cmd(trimmed).map_err(|_| "Failed to parse add rule")?;
-            let is_drop = rule.verdict.is_drop();
-            let mut lock = FIREWALL_ENGINE.lock();
-            if lock.is_none() {
-                *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
-            }
-            if let Some(ref mut engine) = *lock {
-                engine.rules.push(rule);
-                engine.build();
-            }
+        Err(_) => Err("Failed to parse rule. Format: iptables -A/-I or add/insert ..."),
+    }
+}
 
-            if is_drop {
-                CONNTRACK_TABLE.lock().entries.clear();
-            }
+pub fn init_firewall_with_conf(conf: &str) {
+    let mut lock = FIREWALL_ENGINE.lock();
+    if lock.is_none() {
+        *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
+    }
+    drop(lock);
 
-            Ok(String::from("Rule added successfully.\n"))
+    let _ = execute_cmd("flush");
+
+    match config::load_rules_from_str(conf) {
+        Ok(count) => {
+            log::info!("[axfirewall-init] Declarative configuration loaded ({} rules applied).", count);
         }
-        _ => Err("Unknown command, supported: status, flush, del <idx>, insert <idx> <rule>, add <rule>"),
+        Err(e) => {
+            log::error!("[axfirewall-init] Failed to load declarative configuration: {}", e);
+        }
     }
 }
 
 pub fn init_firewall() {
-    let _ = execute_cmd("add in accept tcp 10.0.2.0/24 any 5555");
-    let _ = execute_cmd("add in drop tcp any any 9999");
-    log::info!("[axfirewall] Initialized via unified Control Plane API!");
+    init_firewall_with_conf(config::DEFAULT_FIREWALL_CONF);
 }
 
 pub fn dump_status() -> String {
@@ -638,6 +644,17 @@ pub fn dump_status() -> String {
         FIREWALL_STATS.tx_accepted.load(Ordering::Relaxed),
         FIREWALL_STATS.tx_dropped.load(Ordering::Relaxed),
         FIREWALL_STATS.tx_fastpath.load(Ordering::Relaxed),
+    );
+
+    let total_ano = inspector::ANOMALY_STATS.total_anomaly_dropped.load(Ordering::Relaxed);
+    let null_ano = inspector::ANOMALY_STATS.null_scan_dropped.load(Ordering::Relaxed);
+    let xmas_ano = inspector::ANOMALY_STATS.xmas_scan_dropped.load(Ordering::Relaxed);
+    let synfin_ano = inspector::ANOMALY_STATS.syn_fin_dropped.load(Ordering::Relaxed);
+    let _ = writeln!(out, "------------------- Anomaly Inspector Stats ------------------");
+    let _ = writeln!(
+        out,
+        "Total Blocked: {} (Null Scan: {}, Xmas Scan: {}, SYN+FIN: {})",
+        total_ano, null_ano, xmas_ano, synfin_ano
     );
 
     let lock = FIREWALL_ENGINE.lock();
@@ -685,6 +702,19 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
             return FilterVerdict::Accept;
         }
     };
+
+    if pkt_info.is_anomaly {
+        FIREWALL_STATS.rx_dropped.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "[axfirewall-inspector] DROP ANOMALY IN: {:?} {}:{} -> {}:{}",
+            pkt_info.proto,
+            pkt_info.src_ip,
+            pkt_info.src_port.unwrap_or(0),
+            pkt_info.dst_ip,
+            pkt_info.dst_port.unwrap_or(0),
+        );
+        return FilterVerdict::Drop;
+    }
 
     let flow_key = FlowKey::from_packet(&pkt_info);
     let now = get_current_time_secs();
