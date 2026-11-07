@@ -15,9 +15,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, IpProtocol, Ipv4Address, Ipv4Packet, TcpPacket, UdpPacket,
 };
-use spin::Mutex;
-
+use spin::{Mutex, RwLock};
+use core::sync::atomic::AtomicBool;
 use conntrack::{ConntrackTable, FlowKey};
+
+pub static BYPASS_FIREWALL: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L4Protocol {
@@ -522,7 +524,7 @@ pub fn parse_packet(raw_pkt: &[u8]) -> Option<PacketInfo> {
     })
 }
 
-pub static FIREWALL_ENGINE: Mutex<Option<LbvsEngine>> = Mutex::new(None);
+pub static FIREWALL_ENGINE: RwLock<Option<LbvsEngine>> = RwLock::new(None);
 pub static CONNTRACK_TABLE: Mutex<ConntrackTable> = Mutex::new(ConntrackTable::new());
 
 fn get_current_time_secs() -> u64 {
@@ -543,7 +545,7 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
     }
 
     if trimmed == "flush" || trimmed == "iptables -F" || trimmed == "-F" {
-        let mut lock = FIREWALL_ENGINE.lock();
+        let mut lock = FIREWALL_ENGINE.write();
         if let Some(ref mut engine) = *lock {
             engine.rules.clear();
             engine.build();
@@ -563,7 +565,7 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
         let raw_idx = idx_str.parse::<usize>().map_err(|_| "Invalid rule index")?;
         let idx = if trimmed.contains("-D") { raw_idx.saturating_sub(1) } else { raw_idx };
 
-        let mut lock = FIREWALL_ENGINE.lock();
+        let mut lock = FIREWALL_ENGINE.write();
         if let Some(ref mut engine) = *lock {
             if idx < engine.rules.len() {
                 engine.rules.remove(idx);
@@ -576,10 +578,19 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
         return Err("Firewall engine not initialized");
     }
 
+    if trimmed == "bypass on" {
+        BYPASS_FIREWALL.store(true, Ordering::Relaxed);
+        return Ok(String::from("Firewall completely bypassed (Pure Baseline Mode).\n"));
+    }
+    if trimmed == "bypass off" {
+        BYPASS_FIREWALL.store(false, Ordering::Relaxed);
+        return Ok(String::from("Firewall active.\n"));
+    }
+
     match parser::parse_rule_cmd(trimmed) {
         Ok((insert_idx, rule)) => {
             let is_drop = rule.verdict.is_drop();
-            let mut lock = FIREWALL_ENGINE.lock();
+            let mut lock = FIREWALL_ENGINE.write();
             if lock.is_none() {
                 *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
             }
@@ -604,7 +615,7 @@ pub fn execute_cmd(cmd: &str) -> Result<String, &'static str> {
 }
 
 pub fn init_firewall_with_conf(conf: &str) {
-    let mut lock = FIREWALL_ENGINE.lock();
+    let mut lock = FIREWALL_ENGINE.write();
     if lock.is_none() {
         *lock = Some(LbvsEngine::new(FilterVerdict::Accept));
     }
@@ -657,7 +668,7 @@ pub fn dump_status() -> String {
         total_ano, null_ano, xmas_ano, synfin_ano
     );
 
-    let lock = FIREWALL_ENGINE.lock();
+    let lock = FIREWALL_ENGINE.read();
     if let Some(ref engine) = *lock {
         let _ = writeln!(out, "------------------- Rules & Hit Counters --------------------");
         let _ = writeln!(out, "Idx | Dir  | Proto | Src CIDR          | Dst Port | Verdict | Hits");
@@ -693,6 +704,9 @@ pub fn dump_status() -> String {
 }
 
 pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
+    if BYPASS_FIREWALL.load(Ordering::Relaxed) {
+        return FilterVerdict::Accept;
+    }
     FIREWALL_STATS.rx_total.fetch_add(1, Ordering::Relaxed);
 
     let pkt_info = match parse_packet(raw_pkt) {
@@ -721,49 +735,31 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
 
     if let Some(ref key) = flow_key {
         let mut ct = CONNTRACK_TABLE.lock();
-        if ct.is_established(key) {
-            ct.track_packet(
-                *key,
-                pkt_info.proto == L4Protocol::Tcp,
-                pkt_info.is_syn,
-                pkt_info.is_fin_or_rst,
-                now,
-            );
+        if let Some(cached_verdict) = ct.get_established_verdict(key) {
+            if pkt_info.is_fin_or_rst {
+                ct.track_packet(
+                    *key,
+                    pkt_info.proto == L4Protocol::Tcp,
+                    pkt_info.is_syn,
+                    true,
+                    cached_verdict,
+                    now,
+                );
+            }
             drop(ct);
             FIREWALL_STATS.rx_fastpath.fetch_add(1, Ordering::Relaxed);
             FIREWALL_STATS.rx_accepted.fetch_add(1, Ordering::Relaxed);
-            if pkt_info.is_fin_or_rst {
-                log::info!("{}", dump_status());
-            }
-            return FilterVerdict::Accept;
+            return cached_verdict;
         }
     }
 
-    let mut lock = FIREWALL_ENGINE.lock();
-    if lock.is_none() {
-        drop(lock);
-        init_firewall();
-        lock = FIREWALL_ENGINE.lock();
-    }
-
+    let lock = FIREWALL_ENGINE.read();
     let verdict = if let Some(ref engine) = *lock {
         engine.classify_dir(&pkt_info, Direction::Inbound)
     } else {
         FilterVerdict::Accept
     };
     drop(lock);
-
-    if verdict.should_log() {
-        log::info!(
-            "[axfirewall-audit] IN: {:?} {:?} {}:{} -> {}:{}",
-            verdict,
-            pkt_info.proto,
-            pkt_info.src_ip,
-            pkt_info.src_port.unwrap_or(0),
-            pkt_info.dst_ip,
-            pkt_info.dst_port.unwrap_or(0),
-        );
-    }
 
     if verdict.is_drop() {
         FIREWALL_STATS.rx_dropped.fetch_add(1, Ordering::Relaxed);
@@ -784,11 +780,10 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
                 pkt_info.proto == L4Protocol::Tcp,
                 pkt_info.is_syn,
                 pkt_info.is_fin_or_rst,
+                verdict,
                 now,
             );
-            if ct.entries.len() % 64 == 0 {
-                ct.gc_expired(now);
-            }
+            ct.maybe_gc(now);
         }
     }
 
@@ -796,6 +791,9 @@ pub fn filter_rx_packet(raw_pkt: &[u8]) -> FilterVerdict {
 }
 
 pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
+    if BYPASS_FIREWALL.load(Ordering::Relaxed) {
+        return FilterVerdict::Accept;
+    }
     FIREWALL_STATS.tx_total.fetch_add(1, Ordering::Relaxed);
 
     let pkt_info = match parse_packet(raw_pkt) {
@@ -811,21 +809,22 @@ pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
 
     if let Some(ref key) = flow_key {
         let mut ct = CONNTRACK_TABLE.lock();
-        if ct.is_established(key) {
+        if let Some(cached_verdict) = ct.get_established_verdict(key) {
             ct.track_packet(
                 *key,
                 pkt_info.proto == L4Protocol::Tcp,
                 pkt_info.is_syn,
                 pkt_info.is_fin_or_rst,
+                cached_verdict,
                 now,
             );
             FIREWALL_STATS.tx_fastpath.fetch_add(1, Ordering::Relaxed);
             FIREWALL_STATS.tx_accepted.fetch_add(1, Ordering::Relaxed);
-            return FilterVerdict::Accept;
+            return cached_verdict;
         }
     }
 
-    let lock = FIREWALL_ENGINE.lock();
+    let lock = FIREWALL_ENGINE.read();
     let verdict = if let Some(ref engine) = *lock {
         engine.classify_dir(&pkt_info, Direction::Outbound)
     } else {
@@ -833,28 +832,8 @@ pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
     };
     drop(lock);
 
-    if verdict.should_log() {
-        log::info!(
-            "[axfirewall-audit] OUT: {:?} {:?} {}:{} -> {}:{}",
-            verdict,
-            pkt_info.proto,
-            pkt_info.src_ip,
-            pkt_info.src_port.unwrap_or(0),
-            pkt_info.dst_ip,
-            pkt_info.dst_port.unwrap_or(0),
-        );
-    }
-
     if verdict.is_drop() {
         FIREWALL_STATS.tx_dropped.fetch_add(1, Ordering::Relaxed);
-        log::warn!(
-            "[axfirewall-lbvs] DROP OUT: {:?} {}:{} -> {}:{}",
-            pkt_info.proto,
-            pkt_info.src_ip,
-            pkt_info.src_port.unwrap_or(0),
-            pkt_info.dst_ip,
-            pkt_info.dst_port.unwrap_or(0),
-        );
     } else {
         FIREWALL_STATS.tx_accepted.fetch_add(1, Ordering::Relaxed);
         if let Some(key) = flow_key {
@@ -864,6 +843,7 @@ pub fn filter_tx_packet(raw_pkt: &[u8]) -> FilterVerdict {
                 pkt_info.proto == L4Protocol::Tcp,
                 pkt_info.is_syn,
                 pkt_info.is_fin_or_rst,
+                verdict,
                 now,
             );
         }

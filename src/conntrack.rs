@@ -65,30 +65,38 @@ pub struct ConnEntry {
     pub state: FlowState,
     pub packets_seen: u64,
     pub last_seen_secs: u64,
+    pub verdict: crate::FilterVerdict,
 }
 
 pub struct ConntrackTable {
     pub entries: BTreeMap<FlowKey, ConnEntry>,
+    pub last_gc_secs: u64,
 }
 
 impl ConntrackTable {
     pub const fn new() -> Self {
         Self {
             entries: BTreeMap::new(),
+            last_gc_secs: 0,
         }
     }
 
     #[inline(always)]
     pub fn is_established(&self, key: &FlowKey) -> bool {
+        self.get_established_verdict(key).is_some()
+    }
+
+    #[inline(always)]
+    pub fn get_established_verdict(&self, key: &FlowKey) -> Option<crate::FilterVerdict> {
         if let Some(entry) = self.entries.get(key) {
             match entry.state {
                 FlowState::Tcp(TcpConnState::Established)
                 | FlowState::Tcp(TcpConnState::Closing)
-                | FlowState::Generic => true,
-                _ => false,
+                | FlowState::Generic => Some(entry.verdict),
+                _ => None,
             }
         } else {
-            false
+            None
         }
     }
 
@@ -98,6 +106,7 @@ impl ConntrackTable {
         is_tcp: bool,
         is_syn: bool,
         is_fin_or_rst: bool,
+        verdict: crate::FilterVerdict,
         now_secs: u64,
     ) {
         let entry = self.entries.entry(key).or_insert_with(|| {
@@ -107,12 +116,14 @@ impl ConntrackTable {
                         state: FlowState::Tcp(TcpConnState::SynSent),
                         packets_seen: 0,
                         last_seen_secs: now_secs,
+                        verdict, 
                     }
                 } else {
                     ConnEntry {
                         state: FlowState::Tcp(TcpConnState::Established),
                         packets_seen: 0,
                         last_seen_secs: now_secs,
+                        verdict, 
                     }
                 }
             } else {
@@ -120,12 +131,14 @@ impl ConntrackTable {
                     state: FlowState::Generic,
                     packets_seen: 0,
                     last_seen_secs: now_secs,
+                    verdict, 
                 }
             }
         });
 
         entry.packets_seen += 1;
         entry.last_seen_secs = now_secs;
+        entry.verdict = verdict; 
 
         if is_tcp {
             if let FlowState::Tcp(ref mut tcp_state) = entry.state {
@@ -137,7 +150,12 @@ impl ConntrackTable {
             }
         }
     }
-
+    pub fn maybe_gc(&mut self, now_secs: u64) {
+        if self.entries.len() > 512 && now_secs.saturating_sub(self.last_gc_secs) >= 5 {
+            self.last_gc_secs = now_secs;
+            self.gc_expired(now_secs);
+        }
+    }
     pub fn gc_expired(&mut self, now_secs: u64) {
         self.entries.retain(|_, entry| {
             let timeout = match entry.state {
